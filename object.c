@@ -94,9 +94,68 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    char header[64];
+    const char *type_str;
+
+    // Step 1: type to string
+    if (type == OBJ_BLOB) type_str = "blob";
+    else if (type == OBJ_TREE) type_str = "tree";
+    else type_str = "commit";
+
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    // Step 2: combine header + data
+    size_t total_len = header_len + len;
+    char *full = malloc(total_len);
+    memcpy(full, header, header_len);
+    memcpy(full + header_len, data, len);
+
+    // Step 3: compute hash
+    compute_hash(full, total_len, id_out);
+
+    // Step 4: dedup
+    if (object_exists(id_out)) {
+        free(full);
+        return 0;
+    }
+
+    // Step 5: create directory
+    char path[512], dir[512];
+    object_path(id_out, path, sizeof(path));
+
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    *slash = '\0';
+
+    mkdir(dir, 0755);
+
+    // Step 6: temp file
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s/tmpXXXXXX", dir);
+
+    int fd = mkstemp(temp_path);
+    if (fd < 0) {
+        free(full);
+        return -1;
+    }
+
+    // Step 7: write + fsync
+    write(fd, full, total_len);
+    fsync(fd);
+    close(fd);
+
+    // Step 8: rename
+    rename(temp_path, path);
+
+    // Step 9: fsync directory
+    int dfd = open(dir, O_DIRECTORY);
+    if (dfd >= 0) {
+        fsync(dfd);
+        close(dfd);
+    }
+
+    free(full);
+    return 0;
 }
 
 // Read an object from the store.
@@ -121,8 +180,56 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 //
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
+// object_read 
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+    // read full file
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
+
+    char *buffer = malloc(size);
+    fread(buffer, 1, size, fp);
+    fclose(fp);
+
+    // Step 1: verify hash
+    ObjectID check;
+    compute_hash(buffer, size, &check);
+
+    if (memcmp(check.hash, id->hash, HASH_SIZE) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    // Step 2: find header/data split
+    char *null_pos = memchr(buffer, '\0', size);
+    if (!null_pos) {
+        free(buffer);
+        return -1;
+    }
+
+    // Step 3: parse header
+    char type_str[10];
+    size_t data_len;
+
+    sscanf(buffer, "%s %zu", type_str, &data_len);
+
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else *type_out = OBJ_COMMIT;
+
+    // Step 4: extract data
+    char *data_start = null_pos + 1;
+
+    *data_out = malloc(data_len);
+    memcpy(*data_out, data_start, data_len);
+    *len_out = data_len;
+
+    free(buffer);
+    return 0;
 }
